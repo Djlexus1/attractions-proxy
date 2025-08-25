@@ -1,151 +1,156 @@
+// server.js
 import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json());
 
-// -------- ENV --------
-const APP_TOKEN = process.env.APP_TOKEN;                // your app-side secret (sent in Authorization header)
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;      // your OpenAI API key (sk-...)
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY;      // optional; if not set, we use free fallback
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const APP_TOKEN = process.env.APP_TOKEN || "";
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY || ""; // optional but recommended
 
-// -------- Helpers --------
-function wantsSearch(text) {
-  const t = (text || "").toLowerCase();
+// --- simple health check
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+// --- tiny helpers ---
+const wantsSearch = (txt = "") => {
+  const t = txt.toLowerCase();
   return (
-    /^search[:\s]/i.test(t) ||
-    /\b(look up|web ?search|what('|’)s new|latest|today|news|breaking)\b/i.test(t)
+    t.startsWith("search:") ||
+    t.includes("latest") || t.includes("today") || t.includes("tonight") ||
+    t.includes("this week") || t.includes("news") ||
+    t.includes("look up") || t.includes("find") || t.includes("hours")
   );
-}
-function cleanQuery(text) {
-  return (text || "").replace(/^search[:\s]*/i, "").trim();
-}
-function clamp(str, n = 1200) {
-  if (!str) return "";
-  return str.length > n ? str.slice(0, n) + "…" : str;
-}
+};
 
-// -------- Tavily (preferred if key present) --------
-async function tavilySearch(query) {
-  if (!TAVILY_API_KEY) return null;
-  const r = await fetch("https://api.tavily.com/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      api_key: TAVILY_API_KEY,
-      query,
-      search_depth: "basic",      // 1 credit
-      max_results: 5,
-      include_answer: true,
-      include_raw_content: true
-    })
-  });
-  if (!r.ok) throw new Error(`Tavily error ${r.status}`);
-  const data = await r.json();
+const cleanQuery = (txt = "") => {
+  const t = txt.trim();
+  return t.toLowerCase().startsWith("search:") ? t.slice(7).trim() : t;
+};
 
-  const items = (data.results || []).map((it, i) =>
-    `#${i + 1} ${it.title}\n${clamp(it.content || it.snippet || "")}\nSource: ${it.url}`
-  );
-  const answer = data.answer ? `\nSummary: ${data.answer}` : "";
-  return `Live web results for: "${query}"\n\n${items.join("\n\n")}${answer}`;
-}
+// --- getLiveContext: Tavily first, free fallback second ---
+async function getLiveContext(query) {
+  if (!query) return null;
 
-// -------- Free fallback (DuckDuckGo + Wikipedia) --------
-async function freeFallbackSearch(query) {
-  // DuckDuckGo Instant Answer
-  const ddg = await fetch(
-    `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`
-  ).then(r => r.json());
-
-  const chunks = [];
-  if (ddg.AbstractText) {
-    chunks.push(
-      `DuckDuckGo Abstract:\n${clamp(ddg.AbstractText)}\nSource: ${ddg.AbstractURL || "https://duckduckgo.com/"}`
-    );
-  }
-
-  const rt = Array.isArray(ddg.RelatedTopics) ? ddg.RelatedTopics : [];
-  const firstLink =
-    rt.find(x => x && x.Text && x.FirstURL) ||
-    (rt[0] && rt[0].Topics ? rt[0].Topics.find(t => t.Text && t.FirstURL) : null);
-  if (firstLink) {
-    chunks.push(`Related:\n${clamp(firstLink.Text)}\nSource: ${firstLink.FirstURL}`);
-  }
-
-  // Wikipedia summary
-  let wikiTitle = null;
-  if (ddg.AbstractURL && ddg.AbstractURL.includes("wikipedia.org/wiki/")) {
-    wikiTitle = decodeURIComponent(ddg.AbstractURL.split("/wiki/")[1] || "");
-  } else if (query.length < 120) {
-    wikiTitle = query.trim().replace(/\s+/g, "_");
-  }
-  if (wikiTitle) {
-    const wiki = await fetch(
-      `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(wikiTitle)}`
-    ).then(r => (r.ok ? r.json() : null));
-    if (wiki && wiki.extract) {
-      chunks.push(
-        `Wikipedia:\n${clamp(wiki.extract)}\nSource: ${wiki.content_urls?.desktop?.page || `https://en.wikipedia.org/wiki/${wikiTitle}`}`
-      );
+  // 1) Tavily (best quality)
+  if (TAVILY_API_KEY) {
+    try {
+      const r = await fetch("https://api.tavily.com/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          api_key: TAVILY_API_KEY,
+          query,
+          search_depth: "advanced",
+          max_results: 5,
+          include_answer: true,
+          include_images: false
+        })
+      });
+      const data = await r.json();
+      if (data?.results?.length) {
+        return {
+          summary: data.answer || "",
+          sources: data.results.map(x => ({
+            title: x.title || "",
+            url: x.url || ""
+          }))
+        };
+      }
+    } catch (e) {
+      console.error("Tavily error:", e.message);
     }
   }
 
-  if (!chunks.length) chunks.push("No free search snippets found.");
-  return `Live web (free fallback) for: "${query}"\n\n${chunks.join("\n\n")}`;
+  // 2) Free fallback: DuckDuckGo Lite (no key)
+  try {
+    const u = new URL("https://duckduckgo.com/html/");
+    u.searchParams.set("q", query);
+    const r = await fetch(u.toString(), { method: "GET" });
+    const html = await r.text();
+    // Extremely light parse: pull first 3 results
+    // (This is intentionally simple; it still gives titles/links.)
+    const results = [];
+    const regex = /<a rel="nofollow" class="result__a" href="([^"]+)"[^>]*>(.*?)<\/a>/gi;
+    let m;
+    while ((m = regex.exec(html)) && results.length < 3) {
+      const url = m[1].replace(/^\/l\/\?kh=-1&uddg=/, "");
+      const title = m[2].replace(/<[^>]+>/g, "");
+      results.push({ title, url: decodeURIComponent(url) });
+    }
+    if (results.length) {
+      return {
+        summary: `Top results for: ${query}`,
+        sources: results
+      };
+    }
+  } catch (e) {
+    console.error("DDG fallback error:", e.message);
+  }
+
+  return null;
 }
 
-// -------- Wrapper to choose Tavily or fallback --------
-async function getLiveContext(query) {
-  try {
-    const t = await tavilySearch(query);
-    if (t) return t;
-  } catch (e) {
-    console.error("Tavily failed:", e.message);
-  }
-  try {
-    return await freeFallbackSearch(query);
-  } catch (e) {
-    console.error("Free fallback failed:", e.message);
-    return null;
-  }
-}
-
-// -------- Route --------
 app.post("/chat", async (req, res) => {
   try {
-    // Simple auth so only your app can use this proxy
+    // Auth (so only your app can call this)
     if (APP_TOKEN && req.headers.authorization !== `Bearer ${APP_TOKEN}`) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    let { messages } = req.body || {};
-    if (!messages || !Array.isArray(messages)) {
-      return res.status(400).json({ error: "messages[] required" });
-    }
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ error: "OPENAI_API_KEY missing on server" });
-    }
+    const body = req.body || {};
+    let { messages, forceSearch } = body;
+    messages = Array.isArray(messages) ? messages : [];
 
-    // Detect search intent on the latest user message
     const lastUser = [...messages].reverse().find(m => m.role === "user")?.content || "";
+    const shouldSearch = !!forceSearch || wantsSearch(lastUser);
+    const query = cleanQuery(lastUser);
+    console.log("[/chat] forceSearch:", !!forceSearch, "auto:", wantsSearch(lastUser), "query:", query);
+
     let webContext = null;
-    if (wantsSearch(lastUser)) {
-      const q = cleanQuery(lastUser);
-      webContext = await getLiveContext(q);
+    if (shouldSearch) {
+      webContext = await getLiveContext(query);
+      console.log("[/chat] webContext sources:", webContext?.sources?.length || 0);
     }
 
-    // Build final message list for OpenAI
-    const finalMessages = [
-      {
-        role: "system",
-        content:
-          "You are Attractions Answers: an expert on Orlando theme parks, rides, shows, crowd strategy, and local tourism. " +
-          "If 'Live web' context is provided below, use it and cite the sources explicitly."
-      },
-      ...(webContext ? [{ role: "system", content: webContext }] : []),
-      ...messages
-    ];
+    // Important: tell the model we’ve ALREADY fetched info (don’t “refuse to browse”)
+    const systemPrefix =
+      "You are Attractions Answers: an expert on Orlando parks, rides, shows, and tourism. " +
+      "When web context is provided, treat it as pre-fetched research and cite what it says in natural language. " +
+      "Do NOT say you cannot browse; you are being handed the relevant excerpts already.";
 
+    const webNote = webContext
+      ? `\n\nWeb context for the user query "${query}":\n` +
+        `SUMMARY:\n${webContext.summary}\n` +
+        `SOURCES:\n${webContext.sources.map((s, i) => `${i + 1}. ${s.title} — ${s.url}`).join("\n")}\n`
+      : "";
+
+    const r = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini", // or "gpt-4o-mini-2024-07-18" if you prefer pinned
+        messages: [
+          { role: "system", content: systemPrefix + webNote },
+          ...messages
+        ]
+      })
+    });
+
+    const data = await r.json();
+    return res.status(r.ok ? 200 : r.status).json(data);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Proxy error" });
+  }
+});
+
+// --- start server (Render will use npm start)
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log("Proxy listening on", PORT));
     // Call OpenAI Chat Completions
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
