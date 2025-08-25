@@ -93,14 +93,20 @@ async function getLiveContext(query) {
 
 // ---------- Queue-Times integration ----------
 const PARK_IDS = {
+  // Walt Disney World
   "magic kingdom": 6,
   "epcot": 5,
   "hollywood studios": 7,
   "animal kingdom": 8,
-  "universal studios": 14,
-  "islands of adventure": 15,
-  "epic universe": 21,
-  "seaworld": 22
+  // Universal Orlando
+  "universal studios": 65,            // Universal Studios Florida
+  "universal studios florida": 65,
+  "islands of adventure": 64,
+  "ioa": 64,
+  "epic universe": 334,
+  // SeaWorld
+  "seaworld": 21,
+  "seaworld orlando": 21
 };
 
 const cache = {
