@@ -93,10 +93,10 @@ async function getLiveContext(query) {
 
 // ---------- Queue-Times integration ----------
 const PARK_IDS = {
-  "magic kingdom": 16,
-  "epcot": 17,
-  "hollywood studios": 18,
-  "animal kingdom": 19
+  "magic kingdom": 6,
+  "epcot": 5,
+  "hollywood studios": 7,
+  "animal kingdom": 8
 };
 
 const cache = {
