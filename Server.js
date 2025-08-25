@@ -151,26 +151,3 @@ app.post("/chat", async (req, res) => {
 // --- start server (Render will use npm start)
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("Proxy listening on", PORT));
-    // Call OpenAI Chat Completions
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: finalMessages
-      })
-    });
-
-    const data = await r.json();
-    return res.status(r.ok ? 200 : r.status).json(data);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "Proxy error" });
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Proxy running on ${PORT}`));
