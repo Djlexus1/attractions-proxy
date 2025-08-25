@@ -96,7 +96,11 @@ const PARK_IDS = {
   "magic kingdom": 6,
   "epcot": 5,
   "hollywood studios": 7,
-  "animal kingdom": 8
+  "animal kingdom": 8,
+  "universal studios": 14,
+  "islands of adventure": 15,
+  "epic universe": 21,
+  "seaworld": 22
 };
 
 const cache = {
