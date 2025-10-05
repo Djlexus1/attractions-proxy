@@ -100,14 +100,44 @@ app.get('/qt/parks', (req, res) => {
   res.json(resorts);
 });
 
-app.get('/qt/rides', (req, res) => {
-  const idParam = req.query.parkId;
-  const parkId = Number(idParam);
-  if (!idParam || Number.isNaN(parkId)) {
-    return res.status(400).json({ error: { message: 'Missing or invalid parkId' } });
+app.get('/qt/rides', async (req, res) => {
+  try {
+    const idParam = req.query.parkId;
+    const parkId = Number(idParam);
+    if (!idParam || Number.isNaN(parkId)) {
+      return res.status(400).json({ error: { message: 'Missing or invalid parkId' } });
+    }
+
+    // Queue-Times upstream (full list); fallback to stubs on failure
+    const url = `https://queue-times.com/parks/${parkId}/queue_times.json`;
+    const resp = await fetch(url, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'attractions-proxy/1.0 (+https://example.com)'
+      }
+    });
+
+    if (!resp.ok) throw new Error(`Upstream failed ${resp.status}`);
+
+    const data = await resp.json();
+    const lands = Array.isArray(data.lands) ? data.lands : [];
+    const allRides = lands.flatMap(l => Array.isArray(l.rides) ? l.rides : []);
+
+    const rides = allRides.map(r => ({
+      id: Number(r.id),
+      name: r.name || 'Attraction',
+      wait_time: (typeof r.wait_time === 'number') ? r.wait_time : null,
+      is_open: (typeof r.is_open === 'boolean') ? r.is_open : null
+    }));
+
+    return res.json({ rides });
+  } catch (err) {
+    console.error('/qt/rides error:', err);
+    const idParam = req.query.parkId;
+    const parkId = Number(idParam);
+    const fallback = ridesByPark[parkId] || [];
+    return res.json({ rides: fallback });
   }
-  const rides = ridesByPark[parkId] || [];
-  res.json({ rides });
 });
 
 // --- Tavily integration ---
