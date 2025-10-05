@@ -27,13 +27,25 @@ app.get('/qt/rides', async (req, res) => {
   const parkId = req.query.parkId;
   if (!parkId) return res.status(400).json({ error: 'Missing parkId' });
 
-  const data = await fetch(`https://queue-times.com/parks/${parkId}/queue_times.json`).then(r => r.json());
-  const rides = (data.lands || []).flatMap(l => l.rides || []).map(r => ({
-    id: r.id,
-    name: r.name,
-    wait_time: r.wait_time ?? null,
-    is_open: r.is_open ?? null
-  }));
+  try {
+    const r = await fetch(`https://queue-times.com/parks/${parkId}/queue_times.json`, {
+      headers: { Accept: 'application/json' }
+    });
+    if (!r.ok) return res.status(502).json({ error: `Upstream /parks/${parkId}/queue_times.json failed` });
+    const data = await r.json();
 
-  res.json({ rides });
+    const rides = (data.lands || [])
+      .flatMap(l => l.rides || [])
+      .map(ride => ({
+        id: ride.id,
+        name: ride.name,
+        wait_time: ride.wait_time ?? null,
+        is_open: ride.is_open ?? null
+      }));
+
+    res.set('Cache-Control', 'public, s-maxage=30, max-age=15');
+    res.json({ rides });
+  } catch (e) {
+    res.status(500).json({ error: e.message || 'Unknown error' });
+  }
 });
