@@ -5,7 +5,7 @@ const app = express();
 
 // --- Config ---
 const PORT = process.env.PORT || 3000;
-const APP_TOKEN = process.env.APP_TOKEN || "";        // optional: require Authorization header if set
+const APP_TOKEN = process.env.APP_TOKEN || "";           // optional: require Authorization header if set
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || ""; // required for web browsing via Tavily
 
 // --- Middleware ---
@@ -25,7 +25,7 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'attractions-proxy', time: new Date().toISOString() });
 });
 
-// --- Stub data for parks/rides (keep your app working even without upstream) ---
+// --- Stub data for parks/rides (keeps app working even without upstream) ---
 const resorts = [
   {
     id: 1,
@@ -112,9 +112,9 @@ app.get('/qt/rides', (req, res) => {
 
 // --- Tavily integration ---
 async function tavilySearch(query, {
-  maxResults = 5,
+  maxResults = 8,
   searchDepth = "advanced",   // "basic" or "advanced"
-  topic = "news",             // "news" or "general"
+  topic = "general",          // broader than just “news”
   includeAnswer = true
 } = {}) {
   if (!TAVILY_API_KEY) {
@@ -146,51 +146,81 @@ async function tavilySearch(query, {
   return resp.json();
 }
 
+// Optional: broaden generic queries to your domain
+function contextualizeQuery(q) {
+  const lc = (q || "").toLowerCase();
+  const mentionsParks =
+    lc.includes("disney") || lc.includes("epcot") || lc.includes("magic kingdom") ||
+    lc.includes("animal kingdom") || lc.includes("hollywood studios") ||
+    lc.includes("universal") || lc.includes("islands of adventure") ||
+    lc.includes("sea world") || lc.includes("seaworld");
+  if (!mentionsParks) {
+    return `${q} (Disney World and Universal Orlando context)`;
+  }
+  return q;
+}
+
+// Optional: natural-language heuristic to auto-browse (server-side safety net)
+function shouldBrowse(userText) {
+  const q = (userText || "").toLowerCase();
+  const hints = [
+    "latest", "today", "now", "news", "update", "updated",
+    "hours", "open", "closed", "schedule", "times", "wait",
+    "when is", "what time", "tonight", "this weekend", "this week"
+  ];
+  return hints.some(h => q.includes(h));
+}
+
 // --- Chat endpoint (what your iOS app calls) ---
 app.post('/chat', requireAppToken, async (req, res) => {
   try {
-    const { messages = [], forceSearch = false } = req.body || {};
+    const { messages = [], forceSearch } = req.body || {};
     const lastUser = messages.filter(m => m && m.role === 'user').slice(-1)[0];
     const userText = lastUser?.content || "";
 
-    console.log("[/chat] forceSearch:", forceSearch, "query:", userText);
+    // Respect explicit prefix; otherwise use server-side heuristic as a safety net
+    const hasPrefix = /^search:\s*/i.test(userText);
+    const rawQ = userText.replace(/^search:\s*/i, "").trim();
+    const q = contextualizeQuery(rawQ);
+    const autoBrowse = (typeof forceSearch === 'boolean') ? forceSearch : shouldBrowse(userText);
 
-    if (forceSearch) {
-      const q = userText.replace(/^search:\\s*/i, "").trim();
-      console.log("[tavily] searching for:", q);
+    console.log("[/chat] autoBrowse:", autoBrowse, "prefix:", hasPrefix, "query:", rawQ);
 
-      const t = await tavilySearch(q, {
-        maxResults: 5,
-        searchDepth: "advanced",
-        topic: "news",
-        includeAnswer: true
-      });
+    if (autoBrowse || hasPrefix) {
+      // First attempt: broader search
+      let t = await tavilySearch(q, { maxResults: 8, searchDepth: "advanced", topic: "general", includeAnswer: true });
 
-      const answer = typeof t.answer === "string" && t.answer.trim().length > 0
-        ? t.answer.trim()
-        : null;
+      // Fallback if nothing useful
+      if ((!t.answer || !t.answer.trim()) && (!Array.isArray(t.results) || t.results.length === 0)) {
+        t = await tavilySearch(q, { maxResults: 10, searchDepth: "basic", topic: "general", includeAnswer: true });
+      }
 
+      const answer = typeof t.answer === "string" && t.answer.trim() ? t.answer.trim() : null;
       const results = Array.isArray(t.results) ? t.results : [];
-      console.log("[tavily] results:", results.length);
 
-      const bullets = results.map((r, idx) => {
+      if (!answer && results.length === 0) {
+        return res.json({
+          choices: [{ message: { content: "I couldn’t find a reliable update right now. Try rephrasing with more specifics (include the park and attraction name)." } }]
+        });
+      }
+
+      // Keep reply concise (summary + up to 3 bullets, no URLs)
+      const bullets = results.slice(0, 3).map((r, idx) => {
         const title = r.title || "Result";
-        const url = r.url || "";
-        const snippet = r.content || "";
-        return `${idx + 1}. ${title}\\n   ${snippet}\\n   ${url}`;
-      }).join("\\n\\n");
+        const snippet = (r.content || "").replace(/\s+/g, " ").trim();
+        return `${idx + 1}. ${title}\n   ${snippet}`;
+      }).join("\n\n");
 
       const content = [
-        answer ? `Summary: ${answer}` : `Here are some recent results for “${q}”:`,
-        bullets,
-        "Tip: Arrive early for the shortest waits; check times around meals; watch for evening drops."
-      ].filter(Boolean).join("\\n\\n");
+        answer ? `Summary: ${answer}` : `Here’s what I found:`,
+        bullets
+      ].filter(Boolean).join("\n\n");
 
       return res.json({ choices: [{ message: { content } }] });
     }
 
-    // Non-search fallback
-    const content = `Thanks! You said: “${userText}”. Add “search:” to fetch web updates via Tavily.`;
+    // Non-browsing path
+    const content = `Thanks! You said: “${rawQ}”.`;
     return res.json({ choices: [{ message: { content } }] });
 
   } catch (err) {
