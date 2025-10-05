@@ -1,13 +1,15 @@
 {
-  "name": "attractions-answers-proxy",
+  "name": "attractions-proxy",
   "version": "1.0.0",
   "type": "module",
-  "engines": { "node": ">=18" },
   "scripts": {
     "start": "node Server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "node-fetch": "^3.3.2"
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
