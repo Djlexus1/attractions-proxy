@@ -1,158 +1,129 @@
-// server.js (Node 18+ / ESM)
-import express from 'express';
-import cors from 'cors';
+// server.js
+const express = require('express');
+const cors = require('cors');
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
-// If you’re behind a proxy (Render), this is generally safe:
-app.set('trust proxy', true);
+// 1) Canonical park list with IDs (from your document)
+// Keep this list authoritative. You can move this to a JSON file if you prefer.
+const parks = [
+  // Walt Disney Attractions (id: 2 in your document)
+  { id: 6,  name: "Disney Magic Kingdom", country: "United States" },
+  { id: 16, name: "Disneyland", country: "United States" },
+  { id: 17, name: "Disney California Adventure", country: "United States" },
+  { id: 5,  name: "Epcot", country: "United States" },
+  { id: 7,  name: "Disney Hollywood Studios", country: "United States" },
+  { id: 8,  name: "Animal Kingdom", country: "United States" },
+  { id: 4,  name: "Disneyland Park Paris", country: "France" },
+  { id: 28, name: "Walt Disney Studios Paris", country: "France" },
+  { id: 31, name: "Disneyland Hong Kong", country: "Hong Kong" },
+  { id: 30, name: "Shanghai Disney Resort", country: "China" },
+  { id: 274, name: "Tokyo Disneyland", country: "Japan" },
+  { id: 275, name: "Tokyo DisneySea", country: "Japan" },
 
-const PORT = process.env.PORT || 3000;
-const QT_BASE = 'https://queue-times.com';
+  // Universal (subset)
+  { id: 64, name: "Islands Of Adventure At Universal Orlando", country: "United States" },
+  { id: 65, name: "Universal Studios At Universal Orlando", country: "United States" },
+  { id: 66, name: "Universal Studios Hollywood", country: "United States" },
+  { id: 67, name: "Universal Volcano Bay", country: "United States" },
 
-// Allow list of resort IDs you want to expose.
-// Defaults to WDW(1), Universal Orlando(5), SeaWorld(3).
-// You can override with env: ALLOWED_RESORT_IDS="1,5,3"
-const ALLOWED_RESORT_IDS = (process.env.ALLOWED_RESORT_IDS || '1,5,3')
-  .split(',')
-  .map(s => parseInt(s.trim(), 10))
-  .filter(n => Number.isFinite(n));
+  // Six Flags (subset)
+  { id: 32, name: "Six Flags Magic Mountain", country: "United States" },
+  { id: 37, name: "Six Flags Great Adventure", country: "United States" },
+  { id: 38, name: "Six Flags Great America", country: "United States" },
 
-// Helper: fetch JSON with stable headers + simple diagnostics
-async function fetchJSON(url) {
-  const r = await fetch(url, {
-    headers: {
-      'Accept': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (compatible; MMProxy/1.0; +https://example.com)'
-    }
-  });
-  const text = await r.text();
-  if (!r.ok) {
-    console.error('[fetchJSON] Non-2xx', { url, status: r.status, body: text.slice(0, 300) });
-    const err = new Error(`Upstream error ${r.status}`);
-    err.status = r.status;
-    err.body = text.slice(0, 300);
-    throw err;
-  }
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    console.error('[fetchJSON] Non-JSON upstream', { url, status: r.status, snippet: text.slice(0, 300) });
-    const err = new Error('Upstream returned non-JSON');
-    err.status = r.status;
-    err.body = text.slice(0, 300);
-    throw err;
-  }
+  // Cedar Fair (subset)
+  { id: 50, name: "Cedar Point", country: "United States" },
+  { id: 61, name: "Knott's Berry Farm", country: "United States" },
+  { id: 60, name: "Kings Island", country: "United States" },
+
+  // Add the rest as needed from your document…
+];
+
+// 2) Normalization helper (keep in sync with the app’s normalization)
+function normalizeName(s) {
+  return s
+    .replace(/’/g, "'")
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, ' ');
 }
 
-// Health check
-app.get('/qt/health', (req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
-});
-
-// Parks: group canonical parks by resort and return only allowed resorts
-app.get('/qt/parks', async (req, res) => {
-  try {
-    console.log('[qt/parks] Fetching resorts.json + parks.json');
-    const [resorts, parks] = await Promise.all([
-      fetchJSON(`${QT_BASE}/resorts.json`),
-      fetchJSON(`${QT_BASE}/parks.json`)
-    ]);
-
-    // Group parks by resort_id with id + name only
-    const byResort = new Map();
-    for (const p of parks) {
-      const rid = p.resort_id;
-      if (!byResort.has(rid)) byResort.set(rid, []);
-      byResort.get(rid).push({ id: p.id, name: p.name });
-    }
-
-    // Keep only the resorts we care about
-    const out = resorts
-      .filter(r => ALLOWED_RESORT_IDS.includes(r.id))
-      .map(r => ({
-        id: r.id,
-        name: r.name,
-        parks: byResort.get(r.id) || []
-      }));
-
-    res.set('Cache-Control', 'public, s-maxage=300, max-age=60');
-    res.json(out);
-  } catch (e) {
-    console.error('[qt/parks] failed:', e);
-    res.status(e.status || 500).json({ error: e.message || 'Unknown error' });
+// 3) Name → canonical ID map (to help match legacy/external names)
+const nameToCanonicalId = (() => {
+  const map = {};
+  for (const p of parks) {
+    map[normalizeName(p.name)] = p.id;
   }
-});
 
-// Rides: pass through to canonical endpoint and flatten lands -> rides
-app.get('/qt/rides', async (req, res) => {
-  const parkId = req.query.parkId;
-  if (!parkId) return res.status(400).json({ error: 'Missing parkId' });
-
-  // Bust caches defensively (optional)
-  const url = `${QT_BASE}/parks/${encodeURIComponent(parkId)}/queue_times.json?ts=${Date.now()}`;
-  console.log('[qt/rides] Upstream URL:', url);
-
-  try {
-    const r = await fetch(url, {
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (compatible; MMProxy/1.0; +https://example.com)'
-      }
-    });
-
-    const status = r.status;
-    const text = await r.text();
-    if (status < 200 || status >= 300) {
-      console.error('[qt/rides] Non-2xx upstream', { status, body: text.slice(0, 300) });
-      return res.status(502).json({ error: 'Upstream error', status });
+  // Add aliases if your upstream data uses slightly different names
+  const aliases = [
+    // [alias, canonicalName]
+    ["magic kingdom", "Disney Magic Kingdom"],
+    ["disney's hollywood studios", "Disney Hollywood Studios"],
+    ["disney california adventure", "Disney California Adventure"],
+    ["universal studios orlando", "Universal Studios At Universal Orlando"],
+    ["ioa", "Islands Of Adventure At Universal Orlando"],
+    ["knotts berry farm", "Knott's Berry Farm"],
+  ];
+  for (const [alias, canonicalName] of aliases) {
+    const key = normalizeName(alias);
+    const canonicalKey = normalizeName(canonicalName);
+    if (map[canonicalKey]) {
+      map[key] = map[canonicalKey];
     }
-
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      console.error('[qt/rides] Non-JSON upstream', { snippet: text.slice(0, 300) });
-      return res.status(502).json({ error: 'Upstream returned non-JSON' });
-    }
-
-    // Prefer lands[].rides; some mirrors include top-level rides as well.
-    let rides = [];
-    if (Array.isArray(data.lands)) {
-      rides = data.lands.flatMap(l => Array.isArray(l.rides) ? l.rides : []);
-    }
-    if (rides.length === 0 && Array.isArray(data.rides)) {
-      // Fallback if upstream provided a flat rides array
-      rides = data.rides;
-    }
-
-    const out = rides.map(ride => ({
-      id: ride.id,
-      name: ride.name,
-      wait_time: ride.wait_time ?? null,
-      is_open: ride.is_open ?? null
-    }));
-
-    if (out.length === 0) {
-      console.warn('[qt/rides] Zero rides after flatten. Upstream keys:', Object.keys(data));
-    } else {
-      console.log('[qt/rides] parkId', parkId, 'rides:', out.length, 'first:', out[0]?.name);
-    }
-
-    res.set('Cache-Control', 'public, s-maxage=30, max-age=15');
-    res.json({ rides: out });
-  } catch (e) {
-    console.error('[qt/rides] failed:', e);
-    res.status(e.status || 500).json({ error: e.message || 'Unknown error' });
   }
+  return map;
+})();
+
+// 4) Expose canonical parks
+app.get('/api/parks', (req, res) => {
+  res.json(parks);
 });
 
-// Root landing (optional)
-app.get('/', (req, res) => {
-  res.type('text/plain').send('Attractions proxy is running. Try /qt/parks or /qt/rides?parkId=12');
+// 5) Expose name→id map (optional but helpful for the app to match)
+app.get('/api/park-id-map', (req, res) => {
+  res.json(nameToCanonicalId);
 });
 
+// 6) Wait times keyed by canonical parkId
+// In production, you’d fetch from your real source(s) and translate to canonical.
+// Here we return mocked data to illustrate the shape.
+app.get('/api/wait-times', async (req, res) => {
+  const parkId = parseInt(req.query.parkId, 10);
+  if (!parkId || !parks.find(p => p.id === parkId)) {
+    return res.status(400).json({ error: 'Invalid or missing parkId' });
+  }
+
+  // Example mocked attractions. Replace with real data lookups.
+  const sample = [
+    { id: "space-mountain", name: "Space Mountain", waitMinutes: 45, status: "OPERATING" },
+    { id: "pirates", name: "Pirates of the Caribbean", waitMinutes: 25, status: "OPERATING" },
+    { id: "big-thunder", name: "Big Thunder Mountain", waitMinutes: 35, status: "OPERATING" },
+  ];
+
+  res.json({
+    parkId,
+    updatedAt: new Date().toISOString(),
+    attractions: sample
+  });
+});
+
+// 7) Optional: endpoint to resolve a name to canonical id
+app.get('/api/resolve-park', (req, res) => {
+  const q = req.query.q;
+  if (typeof q !== 'string' || !q.trim()) {
+    return res.status(400).json({ error: 'Missing q' });
+  }
+  const key = normalizeName(q);
+  const id = nameToCanonicalId[key];
+  if (!id) return res.status(404).json({ error: 'Not found' });
+  res.json({ id });
+});
+
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log('Proxy listening on', PORT, 'Allowed resorts:', ALLOWED_RESORT_IDS.join(','));
+  console.log(`server listening on port ${PORT}`);
 });
