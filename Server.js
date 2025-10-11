@@ -1,4 +1,16 @@
 // server.js
+// A simple proxy that exposes a canonical, flat list of parks using IDs
+// from your document, plus endpoints for name->ID resolution and wait times.
+//
+// Setup:
+//   npm init -y
+//   npm install express cors
+//
+// Run:
+//   node server.js
+//
+// Deploy anywhere (Render, Vercel, Fly.io, etc.)
+
 const express = require('express');
 const cors = require('cors');
 
@@ -6,124 +18,158 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 1) Canonical park list with IDs (from your document)
-// Keep this list authoritative. You can move this to a JSON file if you prefer.
-const parks = [
-  // Walt Disney Attractions (id: 2 in your document)
-  { id: 6,  name: "Disney Magic Kingdom", country: "United States" },
-  { id: 16, name: "Disneyland", country: "United States" },
-  { id: 17, name: "Disney California Adventure", country: "United States" },
-  { id: 5,  name: "Epcot", country: "United States" },
-  { id: 7,  name: "Disney Hollywood Studios", country: "United States" },
-  { id: 8,  name: "Animal Kingdom", country: "United States" },
-  { id: 4,  name: "Disneyland Park Paris", country: "France" },
-  { id: 28, name: "Walt Disney Studios Paris", country: "France" },
-  { id: 31, name: "Disneyland Hong Kong", country: "Hong Kong" },
-  { id: 30, name: "Shanghai Disney Resort", country: "China" },
-  { id: 274, name: "Tokyo Disneyland", country: "Japan" },
-  { id: 275, name: "Tokyo DisneySea", country: "Japan" },
+// Optional: basic cache headers for GET endpoints
+const setCacheHeaders = (res, secondsPublic = 60, secondsCDN = 300) => {
+  res.set('Cache-Control', `public, s-maxage=${secondsCDN}, max-age=${secondsPublic}`);
+};
 
-  // Universal (subset)
-  { id: 64, name: "Islands Of Adventure At Universal Orlando", country: "United States" },
-  { id: 65, name: "Universal Studios At Universal Orlando", country: "United States" },
-  { id: 66, name: "Universal Studios Hollywood", country: "United States" },
-  { id: 67, name: "Universal Volcano Bay", country: "United States" },
+// 1) Canonical, flat list of parks with IDs from your document.
+// You can extend this list over time. I included Disney, Universal (subset), Six Flags (subset), and Cedar Fair (subset) to get you going.
+const parks = [
+  // Walt Disney Attractions (doc operator id: 2)
+  { id: 6,   name: "Disney Magic Kingdom", country: "United States", resortId: 1, resortName: "Walt Disney World" },
+  { id: 5,   name: "Epcot", country: "United States", resortId: 1, resortName: "Walt Disney World" },
+  { id: 7,   name: "Disney Hollywood Studios", country: "United States", resortId: 1, resortName: "Walt Disney World" },
+  { id: 8,   name: "Animal Kingdom", country: "United States", resortId: 1, resortName: "Walt Disney World" },
+
+  { id: 16,  name: "Disneyland", country: "United States", resortId: 2, resortName: "Disneyland Resort" },
+  { id: 17,  name: "Disney California Adventure", country: "United States", resortId: 2, resortName: "Disneyland Resort" },
+
+  { id: 4,   name: "Disneyland Park Paris", country: "France", resortId: 3, resortName: "Disneyland Paris" },
+  { id: 28,  name: "Walt Disney Studios Paris", country: "France", resortId: 3, resortName: "Disneyland Paris" },
+
+  { id: 31,  name: "Disneyland Hong Kong", country: "Hong Kong", resortId: 4, resortName: "Hong Kong Disneyland" },
+  { id: 30,  name: "Shanghai Disney Resort", country: "China", resortId: 5, resortName: "Shanghai Disney Resort" },
+  { id: 274, name: "Tokyo Disneyland", country: "Japan", resortId: 6, resortName: "Tokyo Disney Resort" },
+  { id: 275, name: "Tokyo DisneySea", country: "Japan", resortId: 6, resortName: "Tokyo Disney Resort" },
+
+  // Universal Parks & Resorts (subset)
+  { id: 64,  name: "Islands Of Adventure At Universal Orlando", country: "United States", resortId: 10, resortName: "Universal Orlando Resort" },
+  { id: 65,  name: "Universal Studios At Universal Orlando", country: "United States", resortId: 10, resortName: "Universal Orlando Resort" },
+  { id: 67,  name: "Universal Volcano Bay", country: "United States", resortId: 10, resortName: "Universal Orlando Resort" },
+  { id: 66,  name: "Universal Studios Hollywood", country: "United States", resortId: 11, resortName: "Universal Studios Hollywood" },
 
   // Six Flags (subset)
-  { id: 32, name: "Six Flags Magic Mountain", country: "United States" },
-  { id: 37, name: "Six Flags Great Adventure", country: "United States" },
-  { id: 38, name: "Six Flags Great America", country: "United States" },
+  { id: 32,  name: "Six Flags Magic Mountain", country: "United States", resortId: 20, resortName: "Six Flags" },
+  { id: 37,  name: "Six Flags Great Adventure", country: "United States", resortId: 20, resortName: "Six Flags" },
+  { id: 38,  name: "Six Flags Great America", country: "United States", resortId: 20, resortName: "Six Flags" },
 
   // Cedar Fair (subset)
-  { id: 50, name: "Cedar Point", country: "United States" },
-  { id: 61, name: "Knott's Berry Farm", country: "United States" },
-  { id: 60, name: "Kings Island", country: "United States" },
-
-  // Add the rest as needed from your document…
+  { id: 50,  name: "Cedar Point", country: "United States", resortId: 30, resortName: "Cedar Fair" },
+  { id: 61,  name: "Knott's Berry Farm", country: "United States", resortId: 30, resortName: "Cedar Fair" },
+  { id: 60,  name: "Kings Island", country: "United States", resortId: 30, resortName: "Cedar Fair" },
 ];
 
-// 2) Normalization helper (keep in sync with the app’s normalization)
+// 2) Normalization for robust name matching (mirror in your iOS app).
 function normalizeName(s) {
-  return s
+  return String(s || '')
     .replace(/’/g, "'")
     .toLowerCase()
     .trim()
     .replace(/\s+/g, ' ');
 }
 
-// 3) Name → canonical ID map (to help match legacy/external names)
+// 3) Build a name → canonical ID map with helpful aliases.
 const nameToCanonicalId = (() => {
   const map = {};
   for (const p of parks) {
     map[normalizeName(p.name)] = p.id;
   }
 
-  // Add aliases if your upstream data uses slightly different names
+  // Aliases for common variants
   const aliases = [
-    // [alias, canonicalName]
     ["magic kingdom", "Disney Magic Kingdom"],
     ["disney's hollywood studios", "Disney Hollywood Studios"],
-    ["disney california adventure", "Disney California Adventure"],
+    ["hollywood studios", "Disney Hollywood Studios"],
+    ["animal kingdom", "Animal Kingdom"],
+    ["mk", "Disney Magic Kingdom"],
+    ["dhs", "Disney Hollywood Studios"],
+    ["dca", "Disney California Adventure"],
     ["universal studios orlando", "Universal Studios At Universal Orlando"],
     ["ioa", "Islands Of Adventure At Universal Orlando"],
     ["knotts berry farm", "Knott's Berry Farm"],
   ];
+
   for (const [alias, canonicalName] of aliases) {
     const key = normalizeName(alias);
     const canonicalKey = normalizeName(canonicalName);
-    if (map[canonicalKey]) {
-      map[key] = map[canonicalKey];
-    }
+    if (map[canonicalKey]) map[key] = map[canonicalKey];
   }
   return map;
 })();
 
-// 4) Expose canonical parks
-app.get('/api/parks', (req, res) => {
-  res.json(parks);
-});
-
-// 5) Expose name→id map (optional but helpful for the app to match)
-app.get('/api/park-id-map', (req, res) => {
-  res.json(nameToCanonicalId);
-});
-
-// 6) Wait times keyed by canonical parkId
-// In production, you’d fetch from your real source(s) and translate to canonical.
-// Here we return mocked data to illustrate the shape.
-app.get('/api/wait-times', async (req, res) => {
-  const parkId = parseInt(req.query.parkId, 10);
-  if (!parkId || !parks.find(p => p.id === parkId)) {
-    return res.status(400).json({ error: 'Invalid or missing parkId' });
+// 4) GET /qt/parks → flat canonical park list
+app.get('/qt/parks', (req, res) => {
+  try {
+    setCacheHeaders(res);
+    res.type('application/json').json(parks);
+  } catch (e) {
+    console.error('Error /qt/parks:', e);
+    res.status(500).json({ error: 'internal_error' });
   }
-
-  // Example mocked attractions. Replace with real data lookups.
-  const sample = [
-    { id: "space-mountain", name: "Space Mountain", waitMinutes: 45, status: "OPERATING" },
-    { id: "pirates", name: "Pirates of the Caribbean", waitMinutes: 25, status: "OPERATING" },
-    { id: "big-thunder", name: "Big Thunder Mountain", waitMinutes: 35, status: "OPERATING" },
-  ];
-
-  res.json({
-    parkId,
-    updatedAt: new Date().toISOString(),
-    attractions: sample
-  });
 });
 
-// 7) Optional: endpoint to resolve a name to canonical id
-app.get('/api/resolve-park', (req, res) => {
-  const q = req.query.q;
-  if (typeof q !== 'string' || !q.trim()) {
-    return res.status(400).json({ error: 'Missing q' });
+// 5) GET /qt/park-id-map → normalized name → canonical id
+app.get('/qt/park-id-map', (req, res) => {
+  try {
+    setCacheHeaders(res);
+    res.type('application/json').json(nameToCanonicalId);
+  } catch (e) {
+    console.error('Error /qt/park-id-map:', e);
+    res.status(500).json({ error: 'internal_error' });
   }
-  const key = normalizeName(q);
-  const id = nameToCanonicalId[key];
-  if (!id) return res.status(404).json({ error: 'Not found' });
-  res.json({ id });
+});
+
+// 6) Optional helper: resolve a single name to ID
+app.get('/qt/resolve-park', (req, res) => {
+  try {
+    const q = req.query.q;
+    if (typeof q !== 'string' || !q.trim()) {
+      return res.status(400).json({ error: 'missing_query' });
+    }
+    const id = nameToCanonicalId[normalizeName(q)];
+    if (!id) return res.status(404).json({ error: 'not_found' });
+    res.json({ id });
+  } catch (e) {
+    console.error('Error /qt/resolve-park:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// 7) GET /qt/wait-times?parkId=6 → wait times keyed by canonical parkId
+// In production, translate canonical IDs to any upstream provider IDs here and fetch real data.
+app.get('/qt/wait-times', async (req, res) => {
+  try {
+    const parkId = parseInt(req.query.parkId, 10);
+    if (!parkId || !parks.find(p => p.id === parkId)) {
+      return res.status(400).json({ error: 'invalid_parkId' });
+    }
+
+    // Mocked attractions: replace with real lookup.
+    const demoAttractions = [
+      { id: "space-mountain", name: "Space Mountain", waitMinutes: 45, status: "OPERATING" },
+      { id: "pirates", name: "Pirates of the Caribbean", waitMinutes: 25, status: "OPERATING" },
+      { id: "big-thunder", name: "Big Thunder Mountain", waitMinutes: 35, status: "OPERATING" },
+    ];
+
+    setCacheHeaders(res, 15, 60);
+    res.json({
+      parkId,
+      updatedAt: new Date().toISOString(),
+      attractions: demoAttractions
+    });
+  } catch (e) {
+    console.error('Error /qt/wait-times:', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// 8) Health check
+app.get('/qt/health', (req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`server listening on port ${PORT}`);
+  console.log(`server listening on ${PORT}`);
 });
